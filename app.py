@@ -1,8 +1,3 @@
-"""
-Visual Asset Extractor API
-FastAPI backend using Grounding DINO for text-prompted object detection
-+ flood-fill background removal + 4x Lanczos upscale.
-"""
 import os
 import io
 import base64
@@ -16,6 +11,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+from rembg import remove, new_session
 
 # ── App Setup ────────────────────────────────────────────────
 app = FastAPI(title="Visual Asset Extractor API", version="3.0")
@@ -39,6 +35,9 @@ gd_model.eval()
 
 model_size_mb = sum(p.numel() * p.element_size() for p in gd_model.parameters()) / 1e6
 print(f"Grounding DINO loaded on {device} ({model_size_mb:.0f} MB)", flush=True)
+
+print("Loading rembg U-2-Net...", flush=True)
+rembg_session = new_session("u2net")
 
 # ── Detection Concepts ───────────────────────────────────────
 # Two-pass: parent (composite) + child (individual) elements
@@ -80,136 +79,51 @@ def is_notebooklm_logo(box, img_w, img_h):
     return False
 
 
-def remove_color_bg(crop_rgb: np.ndarray, bg_color=(255, 255, 255), tolerance=45) -> np.ndarray:
-    """Remove background by flood-filling from edges with strong anti-aliasing.
+def trim_transparent(rgba: np.ndarray) -> np.ndarray:
+    """Trim fully transparent borders from an RGBA image so the object perfectly fits the rect."""
+    alpha = rgba[:, :, 3]
+    y_non_zero, x_non_zero = np.nonzero(alpha)
+    if len(y_non_zero) == 0:
+        return rgba  # Edge case: totally empty mask
     
-    Improvements:
-    - Auto-detects actual BG color from border pixels if specified BG doesn't match
-    - Higher tolerance for gradient backgrounds  
-    - Multi-pass Gaussian feathering for smooth edges
-    - Morphological refinement to push transition inward
-    """
-    h, w = crop_rgb.shape[:2]
-    if h < 4 or w < 4:
-        rgba = np.zeros((h, w, 4), dtype=np.uint8)
-        rgba[:, :, :3] = crop_rgb
-        rgba[:, :, 3] = 255
-        return rgba
-
-    # Auto-detect BG from border pixels (more reliable than user input)
-    border_pixels = []
-    border_pixels.extend(crop_rgb[0, :].tolist())        # top row
-    border_pixels.extend(crop_rgb[h-1, :].tolist())      # bottom row
-    border_pixels.extend(crop_rgb[:, 0].tolist())         # left col
-    border_pixels.extend(crop_rgb[:, w-1].tolist())       # right col
-    border_arr = np.array(border_pixels, dtype=np.float32)
-    detected_bg = np.median(border_arr, axis=0).astype(np.float32)
-    
-    # Use auto-detected BG if it's close to the specified BG, otherwise use detected
-    specified_bg = np.array(bg_color, dtype=np.float32)
-    bg_diff = np.sqrt(np.sum((detected_bg - specified_bg) ** 2))
-    if bg_diff > 80:
-        # Detected BG is very different from specified — use detected
-        bg = detected_bg
-        print(f"    BG auto-detect: specified={bg_color} detected={tuple(detected_bg.astype(int))} — using detected", flush=True)
-    else:
-        bg = specified_bg
-
-    # Color distance from BG
-    diff = np.sqrt(np.sum((crop_rgb.astype(np.float32) - bg) ** 2, axis=2))
-    color_match = (diff < tolerance).astype(np.uint8) * 255
-
-    # Flood fill from border pixels to find CONNECTED background
-    flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-    bg_connected = np.zeros((h, w), dtype=np.uint8)
-
-    # Collect border seeds (sample every 2 px for speed)
-    border_seeds = set()
-    for x in range(0, w, 2):
-        if color_match[0, x]: border_seeds.add((x, 0))
-        if color_match[h - 1, x]: border_seeds.add((x, h - 1))
-    for y in range(0, h, 2):
-        if color_match[y, 0]: border_seeds.add((0, y))
-        if color_match[y, w - 1]: border_seeds.add((w - 1, y))
-
-    for sx, sy in border_seeds:
-        if bg_connected[sy, sx] == 0 and color_match[sy, sx]:
-            flood_mask[:] = 0
-            cv2.floodFill(
-                color_match.copy(), flood_mask, (sx, sy), 128,
-                loDiff=0, upDiff=0,
-                flags=cv2.FLOODFILL_MASK_ONLY | (8 << 8),
-            )
-            bg_connected |= flood_mask[1:-1, 1:-1]
-
-    # Raw alpha: 255 for foreground, 0 for background
-    alpha_raw = np.where(bg_connected > 0, np.uint8(0), np.uint8(255))
-
-    # ── Strong Anti-Aliasing ──
-    # Step 1: Morphological erosion on BG to push edge inward by 1-2px
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    bg_eroded = cv2.erode(bg_connected, kernel, iterations=1)
-    
-    # Step 2: Create soft transition zone
-    # Edge zone = pixels that were BG but NOT in eroded BG (the 1-2px border)
-    alpha_f = alpha_raw.astype(np.float32)
-    
-    # Step 3: Multi-pass Gaussian blur for smooth feathering
-    alpha_blur = cv2.GaussianBlur(alpha_f, (7, 7), sigmaX=1.5)
-    alpha_blur2 = cv2.GaussianBlur(alpha_f, (5, 5), sigmaX=1.0)
-    
-    # Combine: use hard alpha for clear interior, blurred for edges
-    interior = alpha_raw == 255
-    exterior = bg_eroded > 0
-    # Edge zone: pixels near the boundary
-    edge_zone = ~interior & ~exterior
-    
-    alpha_final = np.zeros_like(alpha_f)
-    alpha_final[interior] = 255.0
-    alpha_final[exterior] = 0.0
-    # Smooth blend in the edge zone
-    alpha_final[edge_zone] = (alpha_blur[edge_zone] * 0.6 + alpha_blur2[edge_zone] * 0.4)
-    
-    # Extra pass: smooth the entire alpha to remove any remaining steps
-    alpha_final = cv2.GaussianBlur(alpha_final, (3, 3), sigmaX=0.7)
-    # Re-clamp interior to prevent bleeding
-    alpha_final[alpha_raw == 255] = np.maximum(alpha_final[alpha_raw == 255], 250.0)
-    alpha_final[bg_eroded > 0] = np.minimum(alpha_final[bg_eroded > 0], 5.0)
-    
-    alpha = alpha_final.clip(0, 255).astype(np.uint8)
-
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[:, :, :3] = crop_rgb
-    rgba[:, :, 3] = alpha
-    return rgba
+    top, bottom = np.min(y_non_zero), np.max(y_non_zero)
+    left, right = np.min(x_non_zero), np.max(x_non_zero)
+    return rgba[top:bottom + 1, left:right + 1]
 
 
-def upscale_4x(rgba: np.ndarray) -> np.ndarray:
-    """Smart upscale with Lanczos + unsharp masking. Caps output at 2048px max dimension."""
+def upscale_crisp(rgba: np.ndarray) -> np.ndarray:
+    """High quality Lanczos upscale tailored to make small UI assets look extremely crisp."""
     h, w = rgba.shape[:2]
     max_dim = max(h, w)
 
-    # Choose scale factor to keep output under 2048px
-    if max_dim * 4 <= 2048:
-        scale = 4
-    elif max_dim * 2 <= 2048:
-        scale = 2
+    # Calculate optimal resolution multiplier (ensure output is ~800px-1200px where possible)
+    if max_dim >= 1200:
+        scale = 1.0
+    elif max_dim * 4 <= 1200:
+        scale = 4.0
+    elif max_dim * 3 <= 1200:
+        scale = 3.0
+    elif max_dim * 2 <= 1200:
+        scale = 2.0
     else:
-        scale = max(1, 2048 / max_dim)
+        scale = 1200.0 / max_dim
 
     new_w = int(w * scale)
     new_h = int(h * scale)
 
-    if new_w <= w and new_h <= h:
-        return rgba  # Already large enough
+    if scale <= 1.0:
+        return rgba
 
+    # Perform High-Quality Resize
     upscaled = cv2.resize(rgba, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    upscaled[:, :, 3] = np.clip(upscaled[:, :, 3], 0, 255)
 
-    # Unsharp mask on RGB only
+    # Moderate unsharp masking on RGB channels (keeps anti-aliased alpha channel smooth)
     rgb = upscaled[:, :, :3]
-    blurred = cv2.GaussianBlur(rgb, (0, 0), sigmaX=1.0)
-    rgb_sharp = cv2.addWeighted(rgb, 1.5, blurred, -0.5, 0)
+    blurred = cv2.GaussianBlur(rgb, (0, 0), sigmaX=0.8)
+    rgb_sharp = cv2.addWeighted(rgb, 1.4, blurred, -0.4, 0)
     upscaled[:, :, :3] = rgb_sharp
+
     return upscaled
 
 
@@ -271,9 +185,9 @@ def detect_and_extract(image_rgb: np.ndarray, bg_color=(255, 255, 255), toleranc
             print(f"    [{i}] SKIP NotebookLM logo", flush=True)
             continue
 
-        # Add padding (8%)
-        pad_x = max(8, int(bw * 0.08))
-        pad_y = max(8, int(bh * 0.08))
+        # Add large padding to give rembg plenty of context to understand the background
+        pad_x = max(20, int(bw * 0.15))
+        pad_y = max(20, int(bh * 0.15))
         bx0 = max(0, x0 - pad_x)
         by0 = max(0, y0 - pad_y)
         bx1 = min(w, x1 + pad_x)
@@ -300,14 +214,25 @@ def detect_and_extract(image_rgb: np.ndarray, bg_color=(255, 255, 255), toleranc
 
     print(f"  After dedup: {len(keep)} unique assets", flush=True)
 
-    # Crop → flood-fill BG removal → upscale → base64
+    # Crop → rembg (U-2-Net with alpha matting) → trim boundaries → scale crisp → base64
     results_b64 = []
     for idx, ki in enumerate(keep):
         bx0, by0, bx1, by1 = kept_boxes[ki]
         crop_rgb = image_rgb[by0:by1, bx0:bx1]
 
-        rgba = remove_color_bg(crop_rgb, bg_color=bg_color, tolerance=tolerance)
-        rgba = upscale_4x(rgba)
+        # Use rembg with severe anti-aliasing via alpha matting
+        rgba = remove(
+            crop_rgb,
+            session=rembg_session,
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=10,
+            post_process_mask=True
+        )
+
+        rgba = trim_transparent(rgba)
+        rgba = upscale_crisp(rgba)
 
         b64 = rgba_to_base64_png(rgba)
         results_b64.append(b64)

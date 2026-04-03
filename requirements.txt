@@ -8,3 +8,5 @@ opencv-python-headless
 Pillow
 PyMuPDF
 numpy
+rembg
+onnxruntime
