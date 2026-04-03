@@ -10,11 +10,10 @@ from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-from ultralytics import SAM
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, SamModel, SamProcessor
 
 # ── App Setup ────────────────────────────────────────────────
-app = FastAPI(title="Visual Asset Extractor API", version="3.0")
+app = FastAPI(title="Visual Asset Extractor API", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,8 +35,10 @@ gd_model.eval()
 model_size_mb = sum(p.numel() * p.element_size() for p in gd_model.parameters()) / 1e6
 print(f"Grounding DINO loaded on {device} ({model_size_mb:.0f} MB)", flush=True)
 
-print("Loading MobileSAM...", flush=True)
-sam_model = SAM('mobile_sam.pt')
+print("Loading Meta SAM (Segment Anything)...", flush=True)
+sam_processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+sam_model = SamModel.from_pretrained("facebook/sam-vit-base").to(device)
+sam_model.eval()
 
 # ── Detection Concepts ───────────────────────────────────────
 # Two-pass: parent (composite) + child (individual) elements
@@ -214,25 +215,33 @@ def detect_and_extract(image_rgb: np.ndarray, bg_color=(255, 255, 255), toleranc
 
     print(f"  After dedup: {len(keep)} unique assets", flush=True)
 
-    # Run MobileSAM → mask smoothing → crop → trim → scale crisp → base64
+    # Run SAM → mask smoothing → crop → trim → scale crisp → base64
     results_b64 = []
+    
+    # Process all image inputs for SAM once
+    print("Preparing SAM image...", flush=True)
+    pil_image = Image.fromarray(image_rgb)
+    
     for idx, ki in enumerate(keep):
         bx0, by0, bx1, by1 = kept_boxes[ki]
 
-        # Use MobileSAM with the bounding box prompt using original uncropped image
-        results = sam_model(image_rgb, bboxes=[bx0, by0, bx1, by1], verbose=False)
+        # Use transformers SAM with mathematically perfect sizing
+        sam_inputs = sam_processor(pil_image, input_boxes=[[[bx0, by0, bx1, by1]]], return_tensors="pt").to(device)
         
-        # Fallback if SAM fails
-        if not results or not hasattr(results[0], "masks") or results[0].masks is None:
-            print(f"    [{idx}] SAM failed to generate mask. Skipping.", flush=True)
-            continue
+        with torch.no_grad():
+            sam_outputs = sam_model(**sam_inputs)
             
-        # Get float32 mask (0.0 to 1.0)
-        mask = results[0].masks.data[0].cpu().numpy().astype(np.float32)
+        masks = sam_processor.image_processor.post_process_masks(
+            sam_outputs.pred_masks.cpu(),
+            sam_inputs["original_sizes"].cpu(),
+            sam_inputs["reshaped_input_sizes"].cpu()
+        )
         
-        # Ensure mask matches image dimensions
-        if mask.shape[0] != h or mask.shape[1] != w:
-            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+        # Get the best mask out of the 3 alternatives SAM returns
+        scores = sam_outputs.iou_scores[0][0]
+        best_mask_idx = torch.argmax(scores).item()
+        mask_binary = masks[0][0][best_mask_idx].numpy()
+        mask = mask_binary.astype(np.float32)
             
         # Severe anti-aliasing (smooth the binary mask)
         mask_blur = cv2.GaussianBlur(mask, (3, 3), sigmaX=0.8)
