@@ -11,7 +11,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-from rembg import remove, new_session
+from ultralytics import SAM
 
 # ── App Setup ────────────────────────────────────────────────
 app = FastAPI(title="Visual Asset Extractor API", version="3.0")
@@ -36,8 +36,8 @@ gd_model.eval()
 model_size_mb = sum(p.numel() * p.element_size() for p in gd_model.parameters()) / 1e6
 print(f"Grounding DINO loaded on {device} ({model_size_mb:.0f} MB)", flush=True)
 
-print("Loading rembg U-2-Net...", flush=True)
-rembg_session = new_session("u2net")
+print("Loading MobileSAM...", flush=True)
+sam_model = SAM('mobile_sam.pt')
 
 # ── Detection Concepts ───────────────────────────────────────
 # Two-pass: parent (composite) + child (individual) elements
@@ -185,9 +185,9 @@ def detect_and_extract(image_rgb: np.ndarray, bg_color=(255, 255, 255), toleranc
             print(f"    [{i}] SKIP NotebookLM logo", flush=True)
             continue
 
-        # Add large padding to give rembg plenty of context to understand the background
-        pad_x = max(20, int(bw * 0.15))
-        pad_y = max(20, int(bh * 0.15))
+        # Add slight padding for SAM prompting
+        pad_x = max(4, int(bw * 0.05))
+        pad_y = max(4, int(bh * 0.05))
         bx0 = max(0, x0 - pad_x)
         by0 = max(0, y0 - pad_y)
         bx1 = min(w, x1 + pad_x)
@@ -214,24 +214,45 @@ def detect_and_extract(image_rgb: np.ndarray, bg_color=(255, 255, 255), toleranc
 
     print(f"  After dedup: {len(keep)} unique assets", flush=True)
 
-    # Crop → rembg (U-2-Net with alpha matting) → trim boundaries → scale crisp → base64
+    # Run MobileSAM → mask smoothing → crop → trim → scale crisp → base64
     results_b64 = []
     for idx, ki in enumerate(keep):
         bx0, by0, bx1, by1 = kept_boxes[ki]
-        crop_rgb = image_rgb[by0:by1, bx0:bx1]
 
-        # Use rembg with severe anti-aliasing via alpha matting
-        rgba = remove(
-            crop_rgb,
-            session=rembg_session,
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=10,
-            alpha_matting_erode_size=10,
-            post_process_mask=True
-        )
+        # Use MobileSAM with the bounding box prompt using original uncropped image
+        results = sam_model(image_rgb, bboxes=[bx0, by0, bx1, by1], verbose=False)
+        
+        # Fallback if SAM fails
+        if not results or not hasattr(results[0], "masks") or results[0].masks is None:
+            print(f"    [{idx}] SAM failed to generate mask. Skipping.", flush=True)
+            continue
+            
+        # Get float32 mask (0.0 to 1.0)
+        mask = results[0].masks.data[0].cpu().numpy().astype(np.float32)
+        
+        # Ensure mask matches image dimensions
+        if mask.shape[0] != h or mask.shape[1] != w:
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
+            
+        # Severe anti-aliasing (smooth the binary mask)
+        mask_blur = cv2.GaussianBlur(mask, (3, 3), sigmaX=0.8)
+        alpha = (mask_blur * 255).clip(0, 255).astype(np.uint8)
+        
+        # Apply to full image
+        rgba_full = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba_full[:, :, :3] = image_rgb
+        rgba_full[:, :, 3] = alpha
+        
+        # Crop to bounding box with safe margin
+        margin = 10
+        cy0 = max(0, by0 - margin)
+        cy1 = min(h, by1 + margin)
+        cx0 = max(0, bx0 - margin)
+        cx1 = min(w, bx1 + margin)
+        
+        rgba_crop = rgba_full[cy0:cy1, cx0:cx1]
 
-        rgba = trim_transparent(rgba)
+        rgba = trim_transparent(rgba_crop)
         rgba = upscale_crisp(rgba)
 
         b64 = rgba_to_base64_png(rgba)
