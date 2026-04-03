@@ -80,21 +80,42 @@ def is_notebooklm_logo(box, img_w, img_h):
     return False
 
 
-def remove_color_bg(crop_rgb: np.ndarray, bg_color=(255, 255, 255), tolerance=30) -> np.ndarray:
-    """Remove background by flood-filling from edges.
+def remove_color_bg(crop_rgb: np.ndarray, bg_color=(255, 255, 255), tolerance=45) -> np.ndarray:
+    """Remove background by flood-filling from edges with strong anti-aliasing.
     
-    Only removes pixels CONNECTED to the border that match bg_color.
-    White/colored areas INSIDE objects are preserved.
+    Improvements:
+    - Auto-detects actual BG color from border pixels if specified BG doesn't match
+    - Higher tolerance for gradient backgrounds  
+    - Multi-pass Gaussian feathering for smooth edges
+    - Morphological refinement to push transition inward
     """
     h, w = crop_rgb.shape[:2]
-    if h < 2 or w < 2:
+    if h < 4 or w < 4:
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
         rgba[:, :, :3] = crop_rgb
         rgba[:, :, 3] = 255
         return rgba
 
-    # Mask of pixels matching background color within tolerance
-    bg = np.array(bg_color, dtype=np.float32)
+    # Auto-detect BG from border pixels (more reliable than user input)
+    border_pixels = []
+    border_pixels.extend(crop_rgb[0, :].tolist())        # top row
+    border_pixels.extend(crop_rgb[h-1, :].tolist())      # bottom row
+    border_pixels.extend(crop_rgb[:, 0].tolist())         # left col
+    border_pixels.extend(crop_rgb[:, w-1].tolist())       # right col
+    border_arr = np.array(border_pixels, dtype=np.float32)
+    detected_bg = np.median(border_arr, axis=0).astype(np.float32)
+    
+    # Use auto-detected BG if it's close to the specified BG, otherwise use detected
+    specified_bg = np.array(bg_color, dtype=np.float32)
+    bg_diff = np.sqrt(np.sum((detected_bg - specified_bg) ** 2))
+    if bg_diff > 80:
+        # Detected BG is very different from specified — use detected
+        bg = detected_bg
+        print(f"    BG auto-detect: specified={bg_color} detected={tuple(detected_bg.astype(int))} — using detected", flush=True)
+    else:
+        bg = specified_bg
+
+    # Color distance from BG
     diff = np.sqrt(np.sum((crop_rgb.astype(np.float32) - bg) ** 2, axis=2))
     color_match = (diff < tolerance).astype(np.uint8) * 255
 
@@ -102,14 +123,14 @@ def remove_color_bg(crop_rgb: np.ndarray, bg_color=(255, 255, 255), tolerance=30
     flood_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
     bg_connected = np.zeros((h, w), dtype=np.uint8)
 
-    # Collect border seeds
-    border_seeds = []
-    for x in range(w):
-        if color_match[0, x]: border_seeds.append((x, 0))
-        if color_match[h - 1, x]: border_seeds.append((x, h - 1))
-    for y in range(h):
-        if color_match[y, 0]: border_seeds.append((0, y))
-        if color_match[y, w - 1]: border_seeds.append((w - 1, y))
+    # Collect border seeds (sample every 2 px for speed)
+    border_seeds = set()
+    for x in range(0, w, 2):
+        if color_match[0, x]: border_seeds.add((x, 0))
+        if color_match[h - 1, x]: border_seeds.add((x, h - 1))
+    for y in range(0, h, 2):
+        if color_match[y, 0]: border_seeds.add((0, y))
+        if color_match[y, w - 1]: border_seeds.add((w - 1, y))
 
     for sx, sy in border_seeds:
         if bg_connected[sy, sx] == 0 and color_match[sy, sx]:
@@ -121,15 +142,41 @@ def remove_color_bg(crop_rgb: np.ndarray, bg_color=(255, 255, 255), tolerance=30
             )
             bg_connected |= flood_mask[1:-1, 1:-1]
 
-    # Alpha: 255 for foreground, 0 for connected background
-    alpha = np.where(bg_connected > 0, np.uint8(0), np.uint8(255))
+    # Raw alpha: 255 for foreground, 0 for background
+    alpha_raw = np.where(bg_connected > 0, np.uint8(0), np.uint8(255))
 
-    # Slight edge AA
-    alpha_f = alpha.astype(np.float32)
-    alpha_blur = cv2.GaussianBlur(alpha_f, (3, 3), sigmaX=0.8)
-    interior = alpha > 240
-    alpha_aa = np.where(interior, 255.0, alpha_blur)
-    alpha = alpha_aa.clip(0, 255).astype(np.uint8)
+    # ── Strong Anti-Aliasing ──
+    # Step 1: Morphological erosion on BG to push edge inward by 1-2px
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    bg_eroded = cv2.erode(bg_connected, kernel, iterations=1)
+    
+    # Step 2: Create soft transition zone
+    # Edge zone = pixels that were BG but NOT in eroded BG (the 1-2px border)
+    alpha_f = alpha_raw.astype(np.float32)
+    
+    # Step 3: Multi-pass Gaussian blur for smooth feathering
+    alpha_blur = cv2.GaussianBlur(alpha_f, (7, 7), sigmaX=1.5)
+    alpha_blur2 = cv2.GaussianBlur(alpha_f, (5, 5), sigmaX=1.0)
+    
+    # Combine: use hard alpha for clear interior, blurred for edges
+    interior = alpha_raw == 255
+    exterior = bg_eroded > 0
+    # Edge zone: pixels near the boundary
+    edge_zone = ~interior & ~exterior
+    
+    alpha_final = np.zeros_like(alpha_f)
+    alpha_final[interior] = 255.0
+    alpha_final[exterior] = 0.0
+    # Smooth blend in the edge zone
+    alpha_final[edge_zone] = (alpha_blur[edge_zone] * 0.6 + alpha_blur2[edge_zone] * 0.4)
+    
+    # Extra pass: smooth the entire alpha to remove any remaining steps
+    alpha_final = cv2.GaussianBlur(alpha_final, (3, 3), sigmaX=0.7)
+    # Re-clamp interior to prevent bleeding
+    alpha_final[alpha_raw == 255] = np.maximum(alpha_final[alpha_raw == 255], 250.0)
+    alpha_final[bg_eroded > 0] = np.minimum(alpha_final[bg_eroded > 0], 5.0)
+    
+    alpha = alpha_final.clip(0, 255).astype(np.uint8)
 
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba[:, :, :3] = crop_rgb
