@@ -14,7 +14,7 @@ COPY . .
 
 # Force rembg to download models to a local directory so it persists permissions across user bounds
 ENV U2NET_HOME=/app/.u2net
-RUN python -c "import os; os.environ['U2NET_HOME'] = '/app/.u2net'; from rembg import new_session; new_session('bria')"
+RUN python -c "import os; os.environ['U2NET_HOME'] = '/app/.u2net'; from rembg import new_session; new_session('bria-rmbg')"
 RUN chmod -R 777 /app/.u2net
 
 EXPOSE 7860

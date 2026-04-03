@@ -37,7 +37,7 @@ model_size_mb = sum(p.numel() * p.element_size() for p in gd_model.parameters())
 print(f"Grounding DINO loaded on {device} ({model_size_mb:.0f} MB)", flush=True)
 
 print("Loading RMBG-1.4 Engine via rembg...", flush=True)
-bria_session = new_session("bria")
+bria_session = new_session("bria-rmbg")
 
 # ── Detection Concepts ───────────────────────────────────────
 # Two-pass: parent (composite) + child (individual) elements
