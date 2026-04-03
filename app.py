@@ -10,8 +10,8 @@ from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, AutoModelForImageSegmentation
-from torchvision import transforms
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+from rembg import remove, new_session
 
 # ── App Setup ────────────────────────────────────────────────
 app = FastAPI(title="Visual Asset Extractor API", version="3.1")
@@ -36,15 +36,8 @@ gd_model.eval()
 model_size_mb = sum(p.numel() * p.element_size() for p in gd_model.parameters()) / 1e6
 print(f"Grounding DINO loaded on {device} ({model_size_mb:.0f} MB)", flush=True)
 
-print("Loading RMBG-1.4 Alpha Matting Engine...", flush=True)
-rmbg_model = AutoModelForImageSegmentation.from_pretrained("briaai/RMBG-1.4", trust_remote_code=True).to(device)
-rmbg_model.eval()
-
-rmbg_transform = transforms.Compose([
-    transforms.Resize((1024, 1024)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [1.0, 1.0, 1.0])
-])
+print("Loading RMBG-1.4 Engine via rembg...", flush=True)
+bria_session = new_session("bria")
 
 # ── Detection Concepts ───────────────────────────────────────
 # Two-pass: parent (composite) + child (individual) elements
@@ -220,33 +213,18 @@ def detect_and_extract(image_rgb: np.ndarray, bg_color=(255, 255, 255), toleranc
 
     print(f"  After dedup: {len(keep)} unique assets", flush=True)
 
-    # Run RMBG-1.4 on the padded crop to get smooth continuous alpha
+    # Run rembg Bria session on padded crop
     results_b64 = []
     
     for idx, ki in enumerate(keep):
         bx0, by0, bx1, by1 = kept_boxes[ki]
         crop_rgb = image_rgb[by0:by1, bx0:bx1]
-        ch, cw = crop_rgb.shape[:2]
-        
-        crop_pil = Image.fromarray(crop_rgb)
-        input_tensor = rmbg_transform(crop_pil).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            preds = rmbg_model(input_tensor)[-1].sigmoid().cpu()
 
-        pred = preds[0].squeeze()
-        pred_pil = transforms.ToPILImage()(pred)
+        # rembg returns raw RGBA image natively (PIL image if input is PIL, numpy if numpy)
+        # We pass crop_rgb (numpy H, W, 3) and it returns (H, W, 4)
+        rgba_rmbg = remove(crop_rgb, session=bria_session)
         
-        # High quality LANCZOS scaling to restore exactly the crop dimensions
-        mask_pil = pred_pil.resize((cw, ch), Image.Resampling.LANCZOS)
-        mask_np = np.array(mask_pil)
-        
-        rgba = np.zeros((ch, cw, 4), dtype=np.uint8)
-        rgba[:, :, :3] = crop_rgb
-        rgba[:, :, 3] = mask_np
-        
-        # Trim extreme transparency boundaries precisely
-        rgba = trim_transparent(rgba)
+        rgba = trim_transparent(rgba_rmbg)
         rgba = upscale_crisp(rgba)
 
         b64 = rgba_to_base64_png(rgba)

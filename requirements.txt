@@ -1,6 +1,6 @@
 torch
 torchvision
-transformers<4.40.0
+transformers
 fastapi
 uvicorn[standard]
 python-multipart
@@ -8,3 +8,5 @@ opencv-python-headless
 Pillow
 PyMuPDF
 numpy
+rembg
+onnxruntime

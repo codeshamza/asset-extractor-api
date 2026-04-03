@@ -12,8 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Download RMBG-1.4 weights during build to bake them into the image
-RUN python -c "from transformers import AutoModelForImageSegmentation; AutoModelForImageSegmentation.from_pretrained('briaai/RMBG-1.4', trust_remote_code=True)"
+# Force rembg to download models to a local directory so it persists permissions across user bounds
+ENV U2NET_HOME=/app/.u2net
+RUN python -c "import os; os.environ['U2NET_HOME'] = '/app/.u2net'; from rembg import new_session; new_session('bria')"
+RUN chmod -R 777 /app/.u2net
 
 EXPOSE 7860
 
