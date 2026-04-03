@@ -1,3 +1,13 @@
+---
+title: Asset Extractor API
+emoji: 🎨
+colorFrom: orange
+colorTo: blue
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Visual Asset Extractor API
 
 FastAPI backend for extracting visual assets from presentation slides using Grounding DINO + flood-fill background removal.
