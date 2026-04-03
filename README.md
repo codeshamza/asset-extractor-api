@@ -1,8 +1,8 @@
 ---
 title: Asset Extractor API
 emoji: 🎨
-colorFrom: orange
-colorTo: blue
+colorFrom: yellow
+colorTo: purple
 sdk: docker
 app_port: 7860
 pinned: false
