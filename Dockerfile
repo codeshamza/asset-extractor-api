@@ -12,8 +12,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Let transformers automatically download RMBG-1.4 on startup
-# HF Spaces expects port 7860
+# Download RMBG-1.4 weights during build to bake them into the image
+RUN python -c "from transformers import AutoModelForImageSegmentation; AutoModelForImageSegmentation.from_pretrained('briaai/RMBG-1.4', trust_remote_code=True)"
+
 EXPOSE 7860
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
