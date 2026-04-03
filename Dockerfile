@@ -12,9 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Download MobileSAM weights during build to bake them into the image
-# This prevents runtime permission errors on HF Spaces
-RUN python -c "from ultralytics import SAM; SAM('mobile_sam.pt')"
+# Download SAM weights during build to bake them into the image
+RUN python -c "from transformers import SamModel, SamProcessor; SamProcessor.from_pretrained('facebook/sam-vit-base'); SamModel.from_pretrained('facebook/sam-vit-base')"
 # HF Spaces expects port 7860
 EXPOSE 7860
 
