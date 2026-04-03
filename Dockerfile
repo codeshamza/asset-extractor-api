@@ -12,8 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Download SAM weights during build to bake them into the image
-RUN python -c "from transformers import SamModel, SamProcessor; SamProcessor.from_pretrained('facebook/sam-vit-base'); SamModel.from_pretrained('facebook/sam-vit-base')"
+# Let transformers automatically download RMBG-1.4 on startup
 # HF Spaces expects port 7860
 EXPOSE 7860
 

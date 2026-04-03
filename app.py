@@ -10,7 +10,8 @@ from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, SamModel, SamProcessor
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection, AutoModelForImageSegmentation
+from torchvision import transforms
 
 # ── App Setup ────────────────────────────────────────────────
 app = FastAPI(title="Visual Asset Extractor API", version="3.1")
@@ -35,10 +36,15 @@ gd_model.eval()
 model_size_mb = sum(p.numel() * p.element_size() for p in gd_model.parameters()) / 1e6
 print(f"Grounding DINO loaded on {device} ({model_size_mb:.0f} MB)", flush=True)
 
-print("Loading Meta SAM (Segment Anything)...", flush=True)
-sam_processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
-sam_model = SamModel.from_pretrained("facebook/sam-vit-base").to(device)
-sam_model.eval()
+print("Loading RMBG-1.4 Alpha Matting Engine...", flush=True)
+rmbg_model = AutoModelForImageSegmentation.from_pretrained("briaai/RMBG-1.4", trust_remote_code=True).to(device)
+rmbg_model.eval()
+
+rmbg_transform = transforms.Compose([
+    transforms.Resize((1024, 1024)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5, 0.5, 0.5], [1.0, 1.0, 1.0])
+])
 
 # ── Detection Concepts ───────────────────────────────────────
 # Two-pass: parent (composite) + child (individual) elements
@@ -186,9 +192,8 @@ def detect_and_extract(image_rgb: np.ndarray, bg_color=(255, 255, 255), toleranc
             print(f"    [{i}] SKIP NotebookLM logo", flush=True)
             continue
 
-        # Add slight padding for SAM prompting
-        pad_x = max(4, int(bw * 0.05))
-        pad_y = max(4, int(bh * 0.05))
+        pad_x = max(10, int(bw * 0.10))
+        pad_y = max(10, int(bh * 0.10))
         bx0 = max(0, x0 - pad_x)
         by0 = max(0, y0 - pad_y)
         bx1 = min(w, x1 + pad_x)
@@ -215,53 +220,33 @@ def detect_and_extract(image_rgb: np.ndarray, bg_color=(255, 255, 255), toleranc
 
     print(f"  After dedup: {len(keep)} unique assets", flush=True)
 
-    # Run SAM → mask smoothing → crop → trim → scale crisp → base64
+    # Run RMBG-1.4 on the padded crop to get smooth continuous alpha
     results_b64 = []
-    
-    # Process all image inputs for SAM once
-    print("Preparing SAM image...", flush=True)
-    pil_image = Image.fromarray(image_rgb)
     
     for idx, ki in enumerate(keep):
         bx0, by0, bx1, by1 = kept_boxes[ki]
-
-        # Use transformers SAM with mathematically perfect sizing
-        sam_inputs = sam_processor(pil_image, input_boxes=[[[bx0, by0, bx1, by1]]], return_tensors="pt").to(device)
+        crop_rgb = image_rgb[by0:by1, bx0:bx1]
+        ch, cw = crop_rgb.shape[:2]
+        
+        crop_pil = Image.fromarray(crop_rgb)
+        input_tensor = rmbg_transform(crop_pil).unsqueeze(0).to(device)
         
         with torch.no_grad():
-            sam_outputs = sam_model(**sam_inputs)
-            
-        masks = sam_processor.image_processor.post_process_masks(
-            sam_outputs.pred_masks.cpu(),
-            sam_inputs["original_sizes"].cpu(),
-            sam_inputs["reshaped_input_sizes"].cpu()
-        )
-        
-        # Get the best mask out of the 3 alternatives SAM returns
-        scores = sam_outputs.iou_scores[0][0]
-        best_mask_idx = torch.argmax(scores).item()
-        mask_binary = masks[0][0][best_mask_idx].numpy()
-        mask = mask_binary.astype(np.float32)
-            
-        # Severe anti-aliasing (smooth the binary mask)
-        mask_blur = cv2.GaussianBlur(mask, (3, 3), sigmaX=0.8)
-        alpha = (mask_blur * 255).clip(0, 255).astype(np.uint8)
-        
-        # Apply to full image
-        rgba_full = np.zeros((h, w, 4), dtype=np.uint8)
-        rgba_full[:, :, :3] = image_rgb
-        rgba_full[:, :, 3] = alpha
-        
-        # Crop to bounding box with safe margin
-        margin = 10
-        cy0 = max(0, by0 - margin)
-        cy1 = min(h, by1 + margin)
-        cx0 = max(0, bx0 - margin)
-        cx1 = min(w, bx1 + margin)
-        
-        rgba_crop = rgba_full[cy0:cy1, cx0:cx1]
+            preds = rmbg_model(input_tensor)[-1].sigmoid().cpu()
 
-        rgba = trim_transparent(rgba_crop)
+        pred = preds[0].squeeze()
+        pred_pil = transforms.ToPILImage()(pred)
+        
+        # High quality LANCZOS scaling to restore exactly the crop dimensions
+        mask_pil = pred_pil.resize((cw, ch), Image.Resampling.LANCZOS)
+        mask_np = np.array(mask_pil)
+        
+        rgba = np.zeros((ch, cw, 4), dtype=np.uint8)
+        rgba[:, :, :3] = crop_rgb
+        rgba[:, :, 3] = mask_np
+        
+        # Trim extreme transparency boundaries precisely
+        rgba = trim_transparent(rgba)
         rgba = upscale_crisp(rgba)
 
         b64 = rgba_to_base64_png(rgba)
