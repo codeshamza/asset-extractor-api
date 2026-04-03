@@ -138,9 +138,24 @@ def remove_color_bg(crop_rgb: np.ndarray, bg_color=(255, 255, 255), tolerance=30
 
 
 def upscale_4x(rgba: np.ndarray) -> np.ndarray:
-    """4x Lanczos upscale with unsharp masking."""
+    """Smart upscale with Lanczos + unsharp masking. Caps output at 2048px max dimension."""
     h, w = rgba.shape[:2]
-    new_w, new_h = w * 4, h * 4
+    max_dim = max(h, w)
+
+    # Choose scale factor to keep output under 2048px
+    if max_dim * 4 <= 2048:
+        scale = 4
+    elif max_dim * 2 <= 2048:
+        scale = 2
+    else:
+        scale = max(1, 2048 / max_dim)
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    if new_w <= w and new_h <= h:
+        return rgba  # Already large enough
+
     upscaled = cv2.resize(rgba, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
     # Unsharp mask on RGB only
