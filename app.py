@@ -177,14 +177,14 @@ def detect_and_extract(image_rgb: np.ndarray, bg_color=(255, 255, 255), toleranc
     results = gd_processor.post_process_grounded_object_detection(
         outputs,
         inputs["input_ids"],
-        box_threshold=0.20,
+        threshold=0.20,
         text_threshold=0.20,
         target_sizes=[(h, w)],
     )[0]
 
     boxes = results["boxes"].cpu().numpy()  # [N, 4] as x0,y0,x1,y1
     scores = results["scores"].cpu().numpy()
-    labels = results["labels"]
+    labels = results.get("labels", results.get("text_labels", [""] * len(boxes)))
 
     print(f"  Grounding DINO: {len(boxes)} raw detections", flush=True)
 
